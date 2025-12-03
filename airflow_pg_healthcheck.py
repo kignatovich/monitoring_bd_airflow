@@ -1,20 +1,77 @@
 #!/usr/bin/env python3
 import os
 import socket
-import sys
 import time
 from contextlib import closing
 
 import psycopg2
 from psycopg2 import OperationalError
+from prometheus_client import start_http_server, Gauge
 
 
-def env(name, default=None, required=False):
-    value = os.getenv(name, default)
-    if required and not value:
-        print(f"CRITICAL: env var {name} is not set", file=sys.stderr)
-        sys.exit(2)
-    return value
+def env(name, default=None, required=False, cast=str):
+    val = os.getenv(name, default)
+    if required and val is None:
+        raise RuntimeError(f"Env var {name} is required")
+    if val is None:
+        return None
+    try:
+        return cast(val)
+    except Exception:
+        return default
+
+
+# ---------- Настройки из ENV ----------
+
+PG_HOST = env("AF_PG_HOST", "127.0.0.1")
+PG_PORT = env("AF_PG_PORT", "5432", cast=int)
+PG_DB = env("AF_PG_DB", "airflow")
+PG_USER = env("AF_PG_USER", "airflow")
+PG_PASSWORD = env("AF_PG_PASSWORD", required=True)
+
+SCRAPE_INTERVAL = env("AF_SCRAPE_INTERVAL_SECONDS", 10, cast=int)
+
+EXPORTER_PORT = env("AF_EXPORTER_PORT", 9105, cast=int)
+EXPORTER_ADDR = env("AF_EXPORTER_ADDR", "0.0.0.0")
+
+# Пороги (для airflow_pg_status, 0=OK,1=WARNING,2=CRITICAL)
+WARN_IDLE_IN_TX = env("AF_WARN_IDLE_IN_TX", 5, cast=int)
+WARN_ACTIVE_CONN = env("AF_WARN_ACTIVE_CONN", 80, cast=int)
+WARN_LATENCY_MS = env("AF_WARN_LATENCY_MS", 500, cast=int)
+
+
+# ---------- Prometheus метрики ----------
+
+# 1 если всё ок (подключились и SELECT 1 прошёл), иначе 0
+PG_UP = Gauge("airflow_pg_up", "Airflow Postgres availability (1=up,0=down)")
+
+# Время ответа SELECT 1, миллисекунды (если ошибка, выставляем -1)
+PG_LATENCY_MS = Gauge("airflow_pg_latency_ms", "Airflow Postgres SELECT 1 latency in ms")
+
+# Общее кол-во коннектов к БД (по datname)
+PG_DB_TOTAL = Gauge("airflow_pg_db_connections_total", "Total connections to Airflow DB")
+PG_DB_ACTIVE = Gauge("airflow_pg_db_connections_active", "Active connections to Airflow DB")
+PG_DB_IDLE_IN_TX = Gauge(
+    "airflow_pg_db_connections_idle_in_tx", "Idle in transaction connections to Airflow DB"
+)
+
+# Конкретно коннекты от Airflow/Celery по application_name
+PG_AF_TOTAL = Gauge(
+    "airflow_pg_af_connections_total", "Total Airflow/Celery connections to Airflow DB"
+)
+PG_AF_ACTIVE = Gauge(
+    "airflow_pg_af_connections_active", "Active Airflow/Celery connections to Airflow DB"
+)
+PG_AF_IDLE_IN_TX = Gauge(
+    "airflow_pg_af_connections_idle_in_tx",
+    "Idle in transaction Airflow/Celery connections to Airflow DB",
+)
+
+# Интегральный статус: 0=OK, 1=WARNING, 2=CRITICAL
+PG_STATUS = Gauge(
+    "airflow_pg_status",
+    "Airflow Postgres health status (0=OK,1=WARNING,2=CRITICAL)",
+)
 
 
 def tcp_check(host: str, port: int, timeout: float = 3.0) -> bool:
@@ -24,60 +81,64 @@ def tcp_check(host: str, port: int, timeout: float = 3.0) -> bool:
             sock.settimeout(timeout)
             sock.connect((host, port))
         return True
-    except OSError as e:
-        print(f"CRITICAL: TCP connect to {host}:{port} failed: {e}", file=sys.stderr)
+    except OSError:
         return False
 
 
-def main():
-    # ---------- 1. Параметры подключения ----------
-    pg_host = env("AF_PG_HOST", required=True)
-    pg_port = int(env("AF_PG_PORT", "5432"))
-    pg_db = env("AF_PG_DB", "airflow")
-    pg_user = env("AF_PG_USER", "airflow")
-    pg_password = env("AF_PG_PASSWORD", required=True)
+def scrape_once():
+    """
+    Один цикл опроса Postgres:
+    - TCP check
+    - SELECT 1
+    - pg_stat_activity
+    - обновление метрик.
+    """
+    status = 0  # 0=OK,1=WARNING,2=CRITICAL
 
-    # Пороговые значения (можно менять через env)
-    warn_idle_in_tx = int(env("AF_WARN_IDLE_IN_TX", "5"))
-    warn_active = int(env("AF_WARN_ACTIVE_CONN", "80"))
-    warn_latency_ms = int(env("AF_WARN_LATENCY_MS", "500"))
+    # ---------- TCP check ----------
+    if not tcp_check(PG_HOST, PG_PORT):
+        PG_UP.set(0)
+        PG_LATENCY_MS.set(-1)
+        PG_STATUS.set(2)
+        # Остальные gauge оставим как есть (последние значения)
+        return
 
-    # ---------- 2. TCP healthcheck ----------
-    if not tcp_check(pg_host, pg_port):
-        sys.exit(2)
-
-    # ---------- 3. Подключение к Postgres ----------
+    # ---------- Подключение к Postgres ----------
     try:
         conn = psycopg2.connect(
-            host=pg_host,
-            port=pg_port,
-            dbname=pg_db,
-            user=pg_user,
-            password=pg_password,
+            host=PG_HOST,
+            port=PG_PORT,
+            dbname=PG_DB,
+            user=PG_USER,
+            password=PG_PASSWORD,
             connect_timeout=3,
-            application_name="airflow_pg_healthcheck",
+            application_name="airflow_pg_exporter",
         )
         conn.autocommit = True
-    except OperationalError as e:
-        print(f"CRITICAL: cannot connect to Postgres: {e}", file=sys.stderr)
-        sys.exit(2)
+    except OperationalError:
+        PG_UP.set(0)
+        PG_LATENCY_MS.set(-1)
+        PG_STATUS.set(2)
+        return
 
-    status = 0  # 0 = OK, 1 = WARNING, 2 = CRITICAL
-    messages = []
+    PG_UP.set(1)
+
+    latency_ms = -1
+    db_total = db_active = db_idle_in_tx = 0
+    af_total = af_active = af_idle_in_tx = 0
 
     try:
         with conn.cursor() as cur:
-            # ---------- 4. Лёгкий тестовый запрос ----------
+            # ---------- SELECT 1 ----------
             start = time.time()
             cur.execute("SELECT 1;")
             row = cur.fetchone()
             latency_ms = (time.time() - start) * 1000
 
             if row != (1,):
-                messages.append("CRITICAL: SELECT 1 returned unexpected result")
                 status = max(status, 2)
 
-            # ---------- 5. Статистика по сессиям ----------
+            # ---------- Общая стата по сессиям ----------
             cur.execute(
                 """
                 SELECT
@@ -87,10 +148,11 @@ def main():
                 FROM pg_stat_activity
                 WHERE datname = %s;
                 """,
-                (pg_db,),
+                (PG_DB,),
             )
-            active, idle_in_tx, total = cur.fetchone() or (0, 0, 0)
+            db_active, db_idle_in_tx, db_total = cur.fetchone() or (0, 0, 0)
 
+            # ---------- Только Airflow/Celery ----------
             cur.execute(
                 """
                 SELECT
@@ -102,54 +164,50 @@ def main():
                   AND (application_name ILIKE 'airflow%%'
                        OR application_name ILIKE 'celery%%');
                 """,
-                (pg_db,),
+                (PG_DB,),
             )
             af_active, af_idle_in_tx, af_total = cur.fetchone() or (0, 0, 0)
 
-    except Exception as e:
-        print(f"CRITICAL: error during health query: {e}", file=sys.stderr)
+    except Exception:
         status = max(status, 2)
-        latency_ms = -1
-        active = idle_in_tx = total = 0
-        af_active = af_idle_in_tx = af_total = 0
     finally:
         conn.close()
 
-    # ---------- 6. Анализ ----------
-    if latency_ms >= 0 and latency_ms > warn_latency_ms:
-        messages.append(
-            f"WARNING: SELECT 1 latency is {latency_ms:.0f} ms (> {warn_latency_ms} ms)."
-        )
-        status = max(status, 1)
-
-    if idle_in_tx > warn_idle_in_tx:
-        messages.append(
-            f"WARNING: idle in transaction sessions = {idle_in_tx} "
-            f"(threshold {warn_idle_in_tx})."
-        )
-        status = max(status, 1)
-
-    if active > warn_active:
-        messages.append(
-            f"WARNING: active sessions = {active} (threshold {warn_active})."
-        )
-        status = max(status, 1)
-
-    # ---------- 7. Итоговый вывод ----------
-    label = ["OK", "WARNING", "CRITICAL"][status]
-    base_msg = (
-        f"PG_HEALTH status={label} | "
-        f"latency_ms={latency_ms:.0f}, "
-        f"db_total={total}, db_active={active}, db_idle_in_tx={idle_in_tx}, "
-        f"af_total={af_total}, af_active={af_active}, af_idle_in_tx={af_idle_in_tx}"
-    )
-
-    if messages:
-        print(base_msg + " :: " + " ; ".join(messages))
+    # ---------- Анализ порогов ----------
+    if latency_ms >= 0:
+        PG_LATENCY_MS.set(latency_ms)
+        if latency_ms > WARN_LATENCY_MS:
+            status = max(status, 1)
     else:
-        print(base_msg)
+        PG_LATENCY_MS.set(-1)
+        status = max(status, 2)
 
-    sys.exit(status)
+    PG_DB_TOTAL.set(db_total)
+    PG_DB_ACTIVE.set(db_active)
+    PG_DB_IDLE_IN_TX.set(db_idle_in_tx)
+
+    PG_AF_TOTAL.set(af_total)
+    PG_AF_ACTIVE.set(af_active)
+    PG_AF_IDLE_IN_TX.set(af_idle_in_tx)
+
+    if db_idle_in_tx > WARN_IDLE_IN_TX:
+        status = max(status, 1)
+    if db_active > WARN_ACTIVE_CONN:
+        status = max(status, 1)
+
+    PG_STATUS.set(status)
+
+
+def main():
+    # Стартуем HTTP-сервер для /metrics
+    start_http_server(EXPORTER_PORT, addr=EXPORTER_ADDR)
+    print(
+        f"Starting Airflow↔Postgres exporter on {EXPORTER_ADDR}:{EXPORTER_PORT}, "
+        f"scrape interval {SCRAPE_INTERVAL}s"
+    )
+    while True:
+        scrape_once()
+        time.sleep(SCRAPE_INTERVAL)
 
 
 if __name__ == "__main__":
