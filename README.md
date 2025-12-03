@@ -5,7 +5,7 @@
 
 ```python
 sudo dnf install -y python3-pip
-sudo pip3 install psycopg2-binary
+sudo pip3 install psycopg2-binary prometheus_client
 ```
 
 ```python
@@ -76,4 +76,21 @@ sudo systemctl list-timers | grep airflow-pg-health
 
 ```bash
 journalctl -u airflow-pg-health.service --no-pager -n 50
+```
+
+Проверка метрик
+```bash
+curl http://localhost:9105/metrics | head
+```
+
+В prometheus.yml добавляем scrape_config
+```yaml
+scrape_configs:
+  - job_name: 'airflow_pg_exporter'
+    static_configs:
+      - targets:
+          - 'HOSTNAME_ГДЕ_БЕЖИТ_ЭКСПОРТЕР:9105'
+        labels:
+          env: 'prod'
+          app: 'airflow'
 ```
